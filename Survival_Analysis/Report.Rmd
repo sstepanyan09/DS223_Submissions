@@ -1,0 +1,362 @@
+---
+title: "Survival Analysis"
+subtitle: "Homework 3"
+author: "Samvel Stepanyan"
+date: "`r Sys.Date()`"
+output:
+  pdf_document:
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Libraries Used  
+**Important Note:** `survminer` package requires `survMisc`, `KMsurv`, `km.ci`. SurvMisc is required for survminer, though you need to download the latest version manually from https://cran.r-project.org/src/contrib/Archive/survMisc/, download the 2022 version.
+
+```{r, eval=FALSE}
+install.packages(c("KMsurv", "km.ci"), repos = "https://cloud.r-project.org")
+```
+
+#Specify the path if you downloaded `survMisc` anywhere else than Downloads folder
+```{r, eval=FALSE}
+install.packages(
+  "~/Downloads/survMisc_0.5.6.tar.gz",
+  repos = NULL,
+  type = "source"
+)
+```
+
+
+```{r}
+library(tidyverse)
+library(survival)
+library(survminer)
+```
+
+```{r}
+telco <- read.csv("telco.csv")
+head(telco)
+```
+
+No missing values, so we may continue
+```{r}
+colSums(is.na(telco))
+```
+
+Encoding churn feature for further model application
+```{r}
+telco <- telco %>%
+  mutate(
+    churn_event = ifelse(churn == "Yes", 1, 0)
+  )
+
+```
+
+Creating the survival object
+```{r}
+surv_obj <- Surv(time = telco$tenure, event = telco$churn_event)
+
+surv_obj[1:10]
+```
+
+```{r}
+aft_formula <- surv_obj ~ age + marital + address + income + ed + retire +
+  gender + voice + internet + forward + custcat + region
+```
+
+
+Listing all the distributions to be tested
+```{r}
+distributions <- c(
+  "extreme",
+  "logistic",
+  "gaussian",
+  "weibull",
+  "exponential",
+  "rayleigh",
+  "loggaussian",
+  "lognormal",
+  "loglogistic",
+  "t"
+)
+
+aft_models <- list()
+
+for (dist in distributions) {
+  aft_models[[dist]] <- survreg(
+    formula = aft_formula,
+    data = telco,
+    dist = dist
+  )
+}
+
+```
+
+
+The candidate AFT models are compared using log-likelihood, which is shown in the `survreg()` model output. A higher log-likelihood indicates a better fit to the observed survival data.
+
+```{r}
+model_comparison <- data.frame(
+  Model = names(aft_models),
+  LogLik = sapply(aft_models, function(model) as.numeric(logLik(model)))
+) %>%
+  arrange(desc(LogLik))
+
+model_comparison
+```
+
+As a decision maker, I would use the lognormal AFT model. The lognormal and loggaussian models achieved the highest log-likelihood, indicating the strongest statistical fit among the tested distributions. Since these two models produce the same fit in this analysis, I choose the lognormal model because it is the more standard and interpretable name. Beyond statistical fit, the lognormal model is preferable because it allows a flexible churn pattern over tenure, unlike the exponential model, which assumes a constant churn risk. This is important in telecom churn because customers may behave differently at early and later tenure stages. The lognormal AFT model is also useful for CLV because it directly models survival time and can generate customer-level survival predictions needed for lifetime value calculations.
+```{r}
+# Kaplan-Meier empirical survival curve
+km_fit <- survfit(surv_obj ~ 1, data = telco)
+
+km_curve <- data.frame(
+  Time = km_fit$time,
+  Survival = km_fit$surv,
+  Model = "Kaplan-Meier"
+)
+
+# Probabilities used for AFT quantile prediction
+# p = cumulative churn probability
+# survival = 1 - p
+p_values <- seq(0.01, 0.99, by = 0.01)
+
+# Function to create average AFT survival curve for one model
+get_aft_curve <- function(model, model_name, data, p_values) {
+  
+  pred_time <- predict(
+    model,
+    newdata = data,
+    type = "quantile",
+    p = p_values
+  )
+  
+  # If prediction returns a matrix, average predicted quantile time across customers
+  if (is.matrix(pred_time)) {
+    avg_time <- colMeans(pred_time, na.rm = TRUE)
+  } else {
+    avg_time <- as.numeric(pred_time)
+  }
+  
+  data.frame(
+    Time = as.numeric(avg_time),
+    Survival = 1 - p_values,
+    Model = model_name
+  )
+}
+
+# Generate AFT curves for all fitted distributions
+aft_curves <- map_dfr(
+  names(aft_models),
+  function(model_name) {
+    get_aft_curve(
+      model = aft_models[[model_name]],
+      model_name = model_name,
+      data = telco,
+      p_values = p_values
+    )
+  }
+)
+
+all_survival_curves <- bind_rows(
+  km_curve,
+  aft_curves
+)
+
+ggplot() +
+  geom_step(
+    data = km_curve,
+    aes(x = Time, y = Survival, color = Model),
+    linewidth = 1.2
+  ) +
+  geom_line(
+    data = aft_curves,
+    aes(x = Time, y = Survival, color = Model),
+    linewidth = 0.9
+  ) +
+  coord_cartesian(
+    xlim = c(0, max(telco$tenure)),
+    ylim = c(0, 1)
+  ) +
+  labs(
+    title = "Kaplan-Meier and AFT Survival Curves",
+    subtitle = "Comparison of empirical survival curve and fitted AFT distributions",
+    x = "Tenure",
+    y = "Survival Probability",
+    color = "Model"
+  ) +
+  theme_bw()
+```
+
+```{r}
+decision_model <- aft_models[["lognormal"]]
+
+summary(decision_model)
+```
+
+```{r}
+coef_table <- as.data.frame(summary(decision_model)$table)
+
+coef_table
+```
+
+
+```{r}
+decision_model <- aft_models[["lognormal"]]
+
+# Extract coefficient table
+coef_table <- as.data.frame(summary(decision_model)$table) %>%
+  rownames_to_column("Coefficient")
+
+# Keep significant coefficients only
+significant_coefficients <- coef_table %>%
+  filter(
+    !Coefficient %in% c("(Intercept)", "Log(scale)"),
+    p < 0.05
+  )
+```
+
+The final reduced model keeps the predictors that were significant in the full lognormal model. Coefficients are interpreted through time ratios: values above 1 mean longer expected survival time, while values below 1 mean shorter expected survival time and higher churn risk.
+
+```{r}
+final_formula <- surv_obj ~ age + marital + address + voice + internet + custcat
+
+final_model <- survreg(
+  formula = final_formula,
+  data = telco,
+  dist = "lognormal"
+)
+
+summary(final_model)
+
+final_coef_table <- as.data.frame(summary(final_model)$table) %>%
+  rownames_to_column("Coefficient") %>%
+  filter(!Coefficient %in% c("(Intercept)", "Log(scale)")) %>%
+  mutate(Time_Ratio = exp(Value))
+
+final_coef_table
+```
+
+CLV is calculated using the lecture logic: monthly margin multiplied by the sum of discounted monthly survival probabilities. Here I use a monthly margin of 1300 and an annual discount rate of 10%.
+
+```{r}
+# CLV setup from slides
+MM <- 1300
+r <- 0.10
+months <- 1:24
+
+# Predicted log survival time from final lognormal model
+lp <- predict(final_model, newdata = telco, type = "lp")
+sigma <- final_model$scale
+
+# Survival probabilities
+surv_probs <- data.frame(ID = telco$ID)
+
+for (m in months) {
+  surv_probs[[paste0("month_", m)]] <- 1 - pnorm((log(m) - lp) / sigma)
+}
+
+# Discount survival probabilities
+discounted_surv <- surv_probs
+
+for (m in months) {
+  discount_factor <- (1 + r / 12) ^ (m - 1)
+  discounted_surv[[paste0("month_", m)]] <- 
+    discounted_surv[[paste0("month_", m)]] / discount_factor
+}
+
+telco$CLV <- MM * rowSums(discounted_surv[paste0("month_", months)])
+
+summary(telco$CLV)
+head(telco$CLV)
+```
+
+The next tables compare predicted CLV across customer segments. I use customer category, internet service, and marital status because they are useful for business interpretation and some of them are included in the final model.
+
+```{r}
+# CLV by customer category
+clv_custcat <- telco %>%
+  group_by(custcat) %>%
+  summarise(
+    n = n(),
+    avg_CLV = mean(CLV),
+    median_CLV = median(CLV)
+  ) %>%
+  arrange(desc(avg_CLV))
+
+clv_custcat
+```
+
+```{r}
+clv_internet <- telco %>%
+  group_by(internet) %>%
+  summarise(
+    n = n(),
+    avg_CLV = mean(CLV),
+    median_CLV = median(CLV)
+  ) %>%
+  arrange(desc(avg_CLV))
+
+clv_internet
+```
+
+```{r}
+clv_marital <- telco %>%
+  group_by(marital) %>%
+  summarise(
+    n = n(),
+    avg_CLV = mean(CLV),
+    median_CLV = median(CLV)
+  ) %>%
+  arrange(desc(avg_CLV))
+
+clv_marital
+```
+
+```{r}
+# Survival probability at 12 months
+telco$surv_12 <- 1 - pnorm((log(12) - lp) / sigma)
+
+# Churn probability within 12 months
+telco$churn_prob_12 <- 1 - telco$surv_12
+
+summary(telco$churn_prob_12)
+```
+
+I define at-risk customers as the top 25% of subscribers with the highest predicted probability of churn within the next 12 months.
+
+```{r}
+risk_cutoff <- quantile(telco$churn_prob_12, 0.75)
+
+telco$at_risk_12 <- ifelse(telco$churn_prob_12 >= risk_cutoff, 1, 0)
+
+table(telco$at_risk_12)
+```
+
+```{r}
+at_risk_summary <- telco %>%
+  filter(at_risk_12 == 1) %>%
+  summarise(
+    n_at_risk = n(),
+    avg_CLV = mean(CLV),
+    total_CLV_at_risk = sum(CLV)
+  )
+
+at_risk_summary
+```
+
+```{r}
+retention_budget_rate <- 0.20
+
+annual_retention_budget <- at_risk_summary$total_CLV_at_risk * retention_budget_rate
+
+annual_retention_budget
+```
+
+## Findings and Recommendations
+
+The lognormal AFT model was selected because it had the highest log-likelihood together with the loggaussian model, while being easier to interpret and more standard for reporting. In the final model, positive coefficients increase expected survival time, while negative coefficients shorten expected survival time and indicate higher churn risk. Age and address have positive effects, meaning older customers and customers who have lived longer at the same address are expected to stay longer. Unmarried customers, customers with voice service, and customers with internet service have shorter expected survival time, meaning they are more likely to churn earlier. Compared with Basic service customers, E-service, Plus service, and Total service customers have much longer expected survival times.
+
+I define valuable customers as customers with high predicted CLV, because they represent higher expected future value after accounting for survival probability and discounting. Based on the segment results, Plus service and E-service customers have the highest average CLV, while Basic service customers have the lowest. Customers without internet service also have higher average CLV than customers with internet service, which is consistent with the model showing that internet service customers have higher churn risk. For the retention budget, I define at-risk subscribers as the top 25% of customers with the highest predicted probability of churn within the next 12 months. This gives 250 at-risk customers with total CLV of 5,193,212. I would allocate 20% of this value as the annual retention budget, giving a budget of 1,038,642. Retention should focus on high-CLV customers who are also at risk, especially through targeted offers, service-quality improvements, and personalized campaigns for internet and voice-service users.
+
